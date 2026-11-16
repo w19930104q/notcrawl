@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/openclaw/notcrawl/internal/config"
+	"github.com/openclaw/notcrawl/internal/exportgen"
 	"github.com/openclaw/notcrawl/internal/notionmcp"
 	"github.com/openclaw/notcrawl/internal/store"
 )
@@ -810,17 +811,7 @@ func TestExportDatabaseAllWritesFilesAndIndex(t *testing.T) {
 	}
 }
 
-type failOnCloseWriter struct {
-	io.WriteCloser
-	closeErr error
-}
-
-func (w failOnCloseWriter) Close() error {
-	_ = w.WriteCloser.Close()
-	return w.closeErr
-}
-
-func TestExportDatabaseOutputReturnsCloseError(t *testing.T) {
+func TestExportDatabaseOutputFailureKeepsPreviousFile(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "notcrawl.db")
@@ -844,25 +835,73 @@ func TestExportDatabaseOutputReturnsCloseError(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	want := errors.New("disk full")
-	orig := createExportOutput
-	t.Cleanup(func() { createExportOutput = orig })
-	createExportOutput = func(name string) (io.WriteCloser, error) {
-		f, err := os.Create(name)
-		if err != nil {
-			return nil, err
-		}
-		return failOnCloseWriter{WriteCloser: f, closeErr: want}, nil
+	outputPath := filepath.Join(dir, "roadmap.csv")
+	original := []byte("previous export\n")
+	if err := os.WriteFile(outputPath, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate a write failure by making the output directory's temp-file
+	// location unusable after preparation: remove write permission on the dir.
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+
+	var stdout, stderr bytes.Buffer
+	err = run(ctx, []string{"--config", filepath.Join(dir, "missing.toml"), "--db", dbPath, "export-db", "--database", "db1", "--output", outputPath}, &stdout, &stderr)
+	if err == nil {
+		t.Fatal("expected export-db --output failure")
+	}
+	got, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, original) {
+		t.Fatalf("failed export replaced previous output: %q", string(got))
+	}
+}
+
+func TestExportDatabaseOutputWritesAtomically(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "notcrawl.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := store.NowMS()
+	if err := st.UpsertCollection(ctx, store.Collection{
+		ID: "db1", Name: "Roadmap", Source: "test", SyncedAt: now, SchemaJSON: `{"Name":{"type":"title"}}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertPage(ctx, store.Page{
+		ID: "page1", CollectionID: "db1", Title: "Ship", URL: "https://example.com/ship", Alive: true, Source: "test", SyncedAt: now,
+		PropertiesJSON: `{"Name":{"type":"title","title":[{"plain_text":"Ship"}]}}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
 	}
 
 	outputPath := filepath.Join(dir, "roadmap.csv")
 	var stdout, stderr bytes.Buffer
-	err = run(ctx, []string{"--config", filepath.Join(dir, "missing.toml"), "--db", dbPath, "export-db", "--database", "db1", "--output", outputPath}, &stdout, &stderr)
-	if err == nil {
-		t.Fatal("expected export-db --output close error")
+	if err := run(ctx, []string{"--config", filepath.Join(dir, "missing.toml"), "--db", dbPath, "export-db", "--database", "db1", "--output", outputPath}, &stdout, &stderr); err != nil {
+		t.Fatalf("export failed: %v\n%s", err, stderr.String())
 	}
-	if !errors.Is(err, want) && !strings.Contains(err.Error(), want.Error()) {
-		t.Fatalf("export-db --output error = %v", err)
+	if got := stdout.String(); !strings.Contains(got, "exported 1 rows") {
+		t.Fatalf("unexpected stdout: %s", got)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".roadmap.csv.tmp-") {
+			t.Fatalf("temporary export file was not cleaned up: %s", entry.Name())
+		}
 	}
 }
 
@@ -1064,5 +1103,113 @@ func TestSQLCommandDoesNotMigrateLegacyArchive(t *testing.T) {
 	}
 	if !bytes.Equal(before, after) {
 		t.Fatal("SQL modified legacy archive")
+	}
+}
+
+func TestExportMarkdownCLIRerunsStagedGeneration(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "notcrawl.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := store.NowMS()
+	if err := st.UpsertSpace(ctx, store.Space{ID: "space1", Name: "Engineering", Source: "test", SyncedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertPage(ctx, store.Page{ID: "page1", SpaceID: "space1", Title: "Launch Plan", Alive: true, Source: "test", SyncedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertBlock(ctx, store.Block{ID: "block1", PageID: "page1", ParentID: "page1", Type: "paragraph", Text: "ship it", Alive: true, Source: "test", SyncedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	pagesDir := filepath.Join(dir, "pages")
+	configPath := filepath.Join(dir, "notcrawl.toml")
+	configBody := fmt.Sprintf("markdown_dir = %q\ncache_dir = %q\n", pagesDir, filepath.Join(dir, "cache"))
+	if err := os.WriteFile(configPath, []byte(configBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	runExport := func() string {
+		t.Helper()
+		var stdout, stderr bytes.Buffer
+		if err := run(ctx, []string{"--config", configPath, "--db", dbPath, "export-md"}, &stdout, &stderr); err != nil {
+			t.Fatalf("export-md failed: %v\n%s", err, stderr.String())
+		}
+		if !strings.Contains(stdout.String(), "exported 1 pages") {
+			t.Fatalf("unexpected stdout: %s", stdout.String())
+		}
+		manifestPath := filepath.Join(pagesDir, exportgen.StateDirName, exportgen.KindMarkdown, "manifest.json")
+		data, err := os.ReadFile(manifestPath)
+		if err != nil {
+			t.Fatalf("manifest missing: %v", err)
+		}
+		var manifest exportgen.Manifest
+		if err := json.Unmarshal(data, &manifest); err != nil {
+			t.Fatal(err)
+		}
+		return manifest.Generation
+	}
+
+	firstGeneration := runExport()
+	var markdownFiles []string
+	if err := filepath.WalkDir(pagesDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() && d.Name() == exportgen.StateDirName {
+			return filepath.SkipDir
+		}
+		if !d.IsDir() && strings.HasSuffix(path, ".md") {
+			markdownFiles = append(markdownFiles, path)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(markdownFiles) != 1 {
+		t.Fatalf("expected one markdown file, got %v", markdownFiles)
+	}
+	firstBytes, err := os.ReadFile(markdownFiles[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// An unchanged rerun starts a new generation but must leave output bytes
+	// identical and keep no staging directories behind.
+	secondGeneration := runExport()
+	if secondGeneration == firstGeneration {
+		t.Fatal("rerun did not switch to a new generation")
+	}
+	secondBytes, err := os.ReadFile(markdownFiles[0])
+	if err != nil || !bytes.Equal(firstBytes, secondBytes) {
+		t.Fatalf("unchanged rerun modified the published markdown: %v", err)
+	}
+	kindDir := filepath.Join(pagesDir, exportgen.StateDirName, exportgen.KindMarkdown)
+	entries, err := os.ReadDir(filepath.Join(kindDir, "generations"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), "tmp-") {
+			t.Fatalf("staging directory survived CLI export: %s", entry.Name())
+		}
+	}
+
+	// A user-owned file next to the archive is never touched by pruning.
+	userNote := filepath.Join(pagesDir, "manual-notes.md")
+	userContent := []byte("# my own notes\n")
+	if err := os.WriteFile(userNote, userContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runExport()
+	got, err := os.ReadFile(userNote)
+	if err != nil || !bytes.Equal(got, userContent) {
+		t.Fatalf("user markdown removed or changed: %v", err)
 	}
 }

@@ -92,6 +92,13 @@ notcrawl export-db --database DATABASE_ID --format csv --output roadmap.csv
 notcrawl export-db --all --dir exports/csv
 ```
 
+`export-md` and `export-db --all` render from one frozen SQLite snapshot into a
+staging directory and switch the published output atomically: each run records
+per-file source digests and content hashes under `.notcrawl-export/`, reuses
+unchanged files on rerun, and keeps the previous generation intact if any item
+fails.
+
+
 The main commands are:
 
 | Command | Purpose |

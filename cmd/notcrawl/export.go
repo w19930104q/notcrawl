@@ -2,17 +2,14 @@ package main
 
 import (
 	"context"
-	"encoding/csv"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/openclaw/notcrawl/internal/config"
 	"github.com/openclaw/notcrawl/internal/markdown"
-	"github.com/openclaw/notcrawl/internal/notiontext"
 	"github.com/openclaw/notcrawl/internal/store"
 	"github.com/openclaw/notcrawl/internal/tableexport"
 )
@@ -23,7 +20,7 @@ func runExportMarkdown(ctx context.Context, stdout io.Writer, cfg config.Config)
 		return err
 	}
 	defer st.Close()
-	s, err := markdown.Exporter{Store: st, Dir: cfg.MarkdownDir}.Export(ctx)
+	s, err := markdown.Exporter{Store: st, Dir: cfg.MarkdownDir, CacheDir: cfg.CacheDir}.Export(ctx)
 	if err != nil {
 		return err
 	}
@@ -50,10 +47,6 @@ func runDatabases(ctx context.Context, stdout io.Writer, cfg config.Config) erro
 		fmt.Fprintf(stdout, "%s\t%s\t%s\n", collection.ID, collection.Name, collection.Source)
 	}
 	return nil
-}
-
-var createExportOutput = func(name string) (io.WriteCloser, error) {
-	return os.Create(name)
 }
 
 func runExportDatabase(ctx context.Context, stdout io.Writer, cfg config.Config, args []string) error {
@@ -93,16 +86,28 @@ func runExportDatabase(ctx context.Context, stdout io.Writer, cfg config.Config,
 	var out io.Writer = stdout
 	var file io.WriteCloser
 	outputName := ""
+	tmpPath := ""
+	committed := false
 	if *output != "" {
 		outputPath, err := config.ExpandPath(*output)
 		if err != nil {
 			return err
 		}
-		file, err = createExportOutput(outputPath)
+		// Render into a sibling temporary file first so a render or close
+		// failure cannot truncate an existing output; swap it in only after
+		// the whole export succeeds.
+		tmp, err := os.CreateTemp(filepath.Dir(outputPath), "."+filepath.Base(outputPath)+".tmp-*")
 		if err != nil {
 			return err
 		}
-		out = file
+		tmpPath = tmp.Name()
+		defer func() {
+			if !committed {
+				_ = os.Remove(tmpPath)
+			}
+		}()
+		file = tmp
+		out = tmp
 		outputName = outputPath
 	}
 	s, exportErr := tableexport.Exporter{Store: st}.Export(ctx, *databaseID, formatValue, out)
@@ -114,6 +119,10 @@ func runExportDatabase(ctx context.Context, stdout io.Writer, cfg config.Config,
 		if closeErr != nil {
 			return closeErr
 		}
+		if err := os.Rename(tmpPath, outputName); err != nil {
+			return err
+		}
+		committed = true
 		fmt.Fprintf(stdout, "exported %d rows and %d columns from %s to %s\n", s.Rows, s.Columns, s.Database, outputName)
 		return nil
 	}
@@ -121,11 +130,10 @@ func runExportDatabase(ctx context.Context, stdout io.Writer, cfg config.Config,
 }
 
 func runExportAllDatabases(ctx context.Context, stdout io.Writer, cfg config.Config, format tableexport.Format, dir string) error {
-	ext, err := exportExtension(format)
-	if err != nil {
+	if err := tableexport.ValidateFormat(format); err != nil {
 		return err
 	}
-	dir, err = config.ExpandPath(dir)
+	dir, err := config.ExpandPath(dir)
 	if err != nil {
 		return err
 	}
@@ -137,81 +145,15 @@ func runExportAllDatabases(ctx context.Context, stdout io.Writer, cfg config.Con
 		return err
 	}
 	defer st.Close()
-	collections, err := st.Collections(ctx)
+	s, err := tableexport.AllExporter{
+		Store:    st,
+		Dir:      dir,
+		Format:   format,
+		CacheDir: cfg.CacheDir,
+	}.Export(ctx)
 	if err != nil {
 		return err
 	}
-	index, err := os.Create(filepath.Join(dir, "index.tsv"))
-	if err != nil {
-		return err
-	}
-	indexWriter := csv.NewWriter(index)
-	indexWriter.Comma = '\t'
-	if err := indexWriter.Write([]string{"id", "name", "source", "rows", "columns", "file"}); err != nil {
-		_ = index.Close()
-		return err
-	}
-	exporter := tableexport.Exporter{Store: st}
-	used := map[string]bool{}
-	var databases, rows int
-	for _, collection := range collections {
-		name := exportDatabaseFilename(collection, ext, used)
-		path := filepath.Join(dir, name)
-		file, err := os.Create(path)
-		if err != nil {
-			_ = index.Close()
-			return err
-		}
-		s, exportErr := exporter.Export(ctx, collection.ID, format, file)
-		closeErr := file.Close()
-		if exportErr != nil {
-			_ = index.Close()
-			return exportErr
-		}
-		if closeErr != nil {
-			_ = index.Close()
-			return closeErr
-		}
-		databases++
-		rows += s.Rows
-		if err := indexWriter.Write([]string{collection.ID, collection.Name, collection.Source, fmt.Sprint(s.Rows), fmt.Sprint(s.Columns), name}); err != nil {
-			_ = index.Close()
-			return err
-		}
-	}
-	indexWriter.Flush()
-	if err := indexWriter.Error(); err != nil {
-		_ = index.Close()
-		return err
-	}
-	if err := index.Close(); err != nil {
-		return err
-	}
-	fmt.Fprintf(stdout, "exported %d databases and %d rows to %s\n", databases, rows, dir)
+	fmt.Fprintf(stdout, "exported %d databases and %d rows to %s\n", s.Databases, s.Rows, dir)
 	return nil
-}
-
-func exportExtension(format tableexport.Format) (string, error) {
-	switch format {
-	case "", tableexport.FormatCSV:
-		return "csv", nil
-	case tableexport.FormatTSV:
-		return "tsv", nil
-	default:
-		return "", fmt.Errorf("unsupported format %q", format)
-	}
-}
-
-func exportDatabaseFilename(collection store.Collection, ext string, used map[string]bool) string {
-	baseName := collection.Name
-	if strings.TrimSpace(baseName) == "" {
-		baseName = collection.ID
-	}
-	base := notiontext.Slug(baseName) + "-" + notiontext.ShortID(collection.ID)
-	name := base + "." + ext
-	for i := 2; used[name]; i++ {
-		name = fmt.Sprintf("%s-%d.%s", base, i, ext)
-	}
-	used[name] = true
-	return name
 }

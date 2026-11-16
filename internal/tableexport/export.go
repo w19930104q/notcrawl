@@ -99,11 +99,15 @@ func ValidateFormat(format Format) error {
 }
 
 func (e Exporter) referenceLabels(ctx context.Context) (ReferenceLabels, error) {
-	users, err := e.Store.UserNames(ctx)
+	return referenceLabelsFor(ctx, e.Store)
+}
+
+func referenceLabelsFor(ctx context.Context, st *store.Store) (ReferenceLabels, error) {
+	users, err := st.UserNames(ctx)
 	if err != nil {
 		return ReferenceLabels{}, err
 	}
-	pages, err := e.Store.PageTitles(ctx)
+	pages, err := st.PageTitles(ctx)
 	if err != nil {
 		return ReferenceLabels{}, err
 	}

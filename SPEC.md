@@ -182,6 +182,24 @@ leaving unrelated Markdown and non-Markdown sidecar files alone. Cleanup recogni
 only files beginning with notcrawl's generated front matter and a closing delimiter;
 quoting the ownership marker in a document body does not make that file generated.
 
+Both `export-md` and `export-db --all` publish verifiable generations from one
+frozen SQLite snapshot. At the start of a run the live archive is copied with
+the SQLite online backup API (so committed WAL frames are included even while
+the live connection stays open) into a private snapshot under the export cache;
+the snapshot is checksummed, rendered read-only, and deleted when the run ends.
+Every page or database is planned from the snapshot with a source digest over
+its inputs, rendered into an independent staging directory
+(`.notcrawl-export/<kind>/generations/tmp-<id>/`), and fingerprinted with its
+result SHA256 and size. Outputs are first hard-linked (with a copy fallback)
+into the new generation tree and only then atomically replaced in the output
+root; `manifest.json` switches last via a temp-file rename. A failed run never
+touches the previous manifest or published files, and its orphaned staging
+directory is reclaimed automatically by the next run. On rerun, items whose
+relative path and source digest are unchanged and whose on-disk hash still
+matches the previous manifest are reused without rendering. Bookkeeping lives
+under `.notcrawl-export/` and is never included in git share output.
+
+
 Each file starts with YAML front matter. String values are double-quoted with
 backslashes, quotes, control characters, and Unicode line separators escaped.
 Ordinary newline characters in metadata are folded to spaces.
@@ -249,3 +267,14 @@ appended alphabetically. Properties whose keys match `page_id`, `page_title`, or
 are ordered by property key and disambiguated with that key. Desktop title
 inference prefers `title`, `Name`, then `name`; other properties are considered
 in key order so repeated exports choose the same fallback title and path.
+
+`--all` writes one delimited file per collection plus an `index.tsv` manifest
+of the export (columns `id`, `name`, `source`, `rows`, `columns`, `file`). The
+whole batch is one staged generation as described under
+[Markdown Archive](#markdown-archive): per-collection source digests drive
+render reuse, and the index and every collection file switch atomically
+together, so a partial failure leaves the previous batch intact. A single
+`--database --output` export likewise stages to a sibling temporary file and
+renames over the target only after a successful write, preserving the previous
+file on failure.
+

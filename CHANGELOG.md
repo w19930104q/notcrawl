@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Publish `export-md` and `export-db --all` as verifiable generations from one frozen SQLite snapshot: files render into an independent staging directory with per-item source digests and result hashes, the manifest switches atomically only after every item succeeds, failed runs preserve the previous generation without deleting user files, and reruns reuse unchanged items while reclaiming orphan staging. Single `export-db --output` writes also stage to a temporary file and rename only on success.
+
 - Pin modernc.org/libc to v1.80.1, matching SQLite v1.62.0's required dependency.
 
 - Build with Go 1.27.4 to fix reachable GO-2026-6859 while retaining the Go 1.27.1 minimum; refresh SQLite, terminal metadata, Go support libraries, CodeQL, and both the TruffleHog action and scanner. Thanks @dependabot! #238 #239 #240

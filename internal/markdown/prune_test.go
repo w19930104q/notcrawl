@@ -6,14 +6,17 @@ import (
 	"testing"
 )
 
-func TestPrunePreservesMarkdownWithoutGeneratedFrontMatter(t *testing.T) {
+func TestOwnershipGatePreservesMarkdownWithoutGeneratedFrontMatter(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		text string
+		want bool
 	}{
-		{"quoted export", "# Export example\n\n```yaml\n---\ngenerated_by: \"notcrawl\"\n---\n```\n"},
-		{"marker in body", "---\ntitle: Notes\n---\ngenerated_by: \"notcrawl\"\n"},
-		{"unterminated header", "---\ngenerated_by: \"notcrawl\"\n"},
+		{"generated", "---\ngenerated_by: \"notcrawl\"\nid: \"x\"\n---\n\nbody", true},
+		{"quoted export", "# Export example\n\n```yaml\n---\ngenerated_by: \"notcrawl\"\n---\n```\n", false},
+		{"marker in body", "---\ntitle: Notes\n---\ngenerated_by: \"notcrawl\"\n", false},
+		{"unterminated header", "---\ngenerated_by: \"notcrawl\"\n", false},
+		{"plain notes", "user notes", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -21,15 +24,8 @@ func TestPrunePreservesMarkdownWithoutGeneratedFrontMatter(t *testing.T) {
 			if err := os.WriteFile(path, []byte(tc.text), 0o644); err != nil {
 				t.Fatal(err)
 			}
-			if err := pruneStaleMarkdown(dir, nil); err != nil {
-				t.Fatal(err)
-			}
-			got, err := os.ReadFile(path)
-			if err != nil {
-				t.Fatalf("unrelated Markdown was removed: %v", err)
-			}
-			if string(got) != tc.text {
-				t.Fatalf("unrelated Markdown changed: %q", got)
+			if got := isNotcrawlGeneratedMarkdown(path); got != tc.want {
+				t.Fatalf("isNotcrawlGeneratedMarkdown = %v, want %v", got, tc.want)
 			}
 		})
 	}

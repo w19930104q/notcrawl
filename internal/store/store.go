@@ -51,6 +51,11 @@ func (s *Store) DB() *sql.DB {
 	return s.db
 }
 
+// Path reports the filesystem path of the opened SQLite database.
+func (s *Store) Path() string {
+	return s.path
+}
+
 func (s *Store) execContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
 	if s.tx != nil {
 		return s.tx.ExecContext(ctx, query, args...)

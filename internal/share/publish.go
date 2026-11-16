@@ -13,6 +13,7 @@ import (
 
 	"github.com/openclaw/crawlkit/mirror"
 	cksnapshot "github.com/openclaw/crawlkit/snapshot"
+	"github.com/openclaw/notcrawl/internal/exportgen"
 	"github.com/openclaw/notcrawl/internal/store"
 )
 
@@ -76,7 +77,12 @@ func Publish(ctx context.Context, st *store.Store, opts PublishOptions) (Publish
 			RootDir:   opts.RepoPath,
 			TargetDir: "pages",
 			Kind:      "markdown",
-			Prune:     func(path string) bool { return strings.HasSuffix(path, ".md") },
+			Include: func(relativePath string) bool {
+				// The export generation state directory is local bookkeeping,
+				// not published Markdown.
+				return !strings.HasPrefix(relativePath, exportgen.StateDirName+"/")
+			},
+			Prune: func(path string) bool { return strings.HasSuffix(path, ".md") },
 		})
 		if err == nil {
 			pagesSynced = true
